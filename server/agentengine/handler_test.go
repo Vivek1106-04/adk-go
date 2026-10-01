@@ -15,6 +15,9 @@
 package agentengine_test
 
 import (
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -70,5 +73,35 @@ func TestNewHandlerRejectsUnusableCompaction(t *testing.T) {
 				t.Errorf("error %q does not name the field an operator has to change", err)
 			}
 		})
+	}
+}
+
+// TestQueryWithoutSSEWriteTimeout checks that a handler built with a zero
+// sseWriteTimeout still answers. A zero timeout used to set the write deadline
+// to the moment the request arrived, so every response was lost.
+func TestQueryWithoutSSEWriteTimeout(t *testing.T) {
+	h, err := agentengine.NewHandler(&launcher.Config{SessionService: session.InMemoryService()}, 0, 1<<20, "engine")
+	if err != nil {
+		t.Fatalf("NewHandler() error = %v", err)
+	}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/reasoning_engine", "application/json",
+		strings.NewReader(`{"class_method":"async_create_session","input":{"user_id":"u"}}`))
+	if err != nil {
+		t.Fatalf("POST /reasoning_engine error = %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading response body: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /reasoning_engine status = %d, want %d; body: %s", resp.StatusCode, http.StatusOK, got)
+	}
+	if !strings.Contains(string(got), `"user_id":"u"`) {
+		t.Errorf("response does not contain the created session:\n%s", got)
 	}
 }

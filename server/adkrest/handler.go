@@ -162,6 +162,8 @@ type ServerConfig struct {
 	MemoryService   memory.Service
 	AgentLoader     agent.Loader
 	ArtifactService artifact.Service
+	// SSEWriteTimeout is the write deadline for a /run_sse response, measured
+	// from when the request arrives. Zero or negative means 120 seconds.
 	SSEWriteTimeout time.Duration
 	PluginConfig    runner.PluginConfig
 	DebugConfig     DebugTelemetryConfig

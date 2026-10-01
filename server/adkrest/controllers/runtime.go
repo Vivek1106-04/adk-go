@@ -37,6 +37,10 @@ import (
 	"google.golang.org/adk/v2/session/compaction"
 )
 
+// defaultSSETimeout is the write deadline for an SSE response when none is
+// configured. It matches the web launcher's --sse-write-timeout default.
+const defaultSSETimeout = 120 * time.Second
+
 // RuntimeAPIController is the controller for the Runtime API.
 type RuntimeAPIController struct {
 	sseTimeout        time.Duration
@@ -145,13 +149,17 @@ func NewRuntimeAPIControllerWithConfig(cfg RuntimeAPIControllerConfig) *RuntimeA
 	if authorizer == nil {
 		authorizer = authz.NewNoop()
 	}
+	sseTimeout := cfg.SSETimeout
+	if sseTimeout <= 0 {
+		sseTimeout = defaultSSETimeout
+	}
 
 	return &RuntimeAPIController{
 		sessionService:         cfg.SessionService,
 		memoryService:          cfg.MemoryService,
 		agentLoader:            cfg.AgentLoader,
 		artifactService:        cfg.ArtifactService,
-		sseTimeout:             cfg.SSETimeout,
+		sseTimeout:             sseTimeout,
 		pluginConfig:           cfg.PluginConfig,
 		autoCreateSession:      cfg.AutoCreateSession,
 		checkOrigin:            cfg.CheckOrigin,
