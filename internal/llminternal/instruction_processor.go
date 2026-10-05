@@ -71,8 +71,10 @@ var placeholderRegex = regexp.MustCompile(`{+[^{}]*}+`)
 
 // A placeholder directly after one of these bytes is literal text, e.g.
 // "${expression}" or "\{expression}". adk-python expresses this as the
-// negative lookbehind (?<![\$\{\\]), which RE2 does not support.
-const literalPlaceholderPrefixes = `${\`
+// negative lookbehind (?<![\$\{\\]), which RE2 does not support. The { from
+// that lookbehind is not needed here: {+ always starts a match at the first
+// brace of a run, so a match is never preceded by {.
+const literalPlaceholderPrefixes = `$\`
 
 func appendInstructions(ctx agent.InvocationContext, req *model.LLMRequest, agentState *State) error {
 	if agentState.InstructionProvider != nil {

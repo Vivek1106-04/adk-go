@@ -105,6 +105,24 @@ func TestInjectSessionState(t *testing.T) {
 			state:    map[string]any{"expression": "foo", "user_name": "bar"},
 			want:     "Workflow syntax: ${{expression}} and bar.",
 		},
+		{
+			name:     "placeholder at start of template",
+			template: "{user_name}, welcome",
+			state:    map[string]any{"user_name": "Foo"},
+			want:     "Foo, welcome",
+		},
+		{
+			name:     "dollar-brace pattern at start of template",
+			template: "${user_name}, welcome",
+			state:    map[string]any{"user_name": "Foo"},
+			want:     "${user_name}, welcome",
+		},
+		{
+			name:     "double-brace placeholder is replaced",
+			template: "Say {{user_name}}",
+			state:    map[string]any{"user_name": "Foo"},
+			want:     "Say Foo",
+		},
 		// Corresponds to: test_inject_session_state_with_missing_artifact_raises_key_error
 		{
 			name:     "missing required artifact",
