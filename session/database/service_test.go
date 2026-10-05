@@ -511,3 +511,55 @@ func TestEventsSharingATimestampComeBackInAStableOrder(t *testing.T) {
 		t.Errorf("tied events came back in reverse insertion order:\n%v", first)
 	}
 }
+
+// App and user state are shared across sessions and stored as one JSON
+// document per row, so AppendEvent reads, merges and writes the whole row.
+// Without a row lock, two sessions appending at once on Postgres or MySQL both
+// read the old row and the later write drops the earlier one's keys. SQLite
+// serializes writers and drops the FOR UPDATE clause, so this test checks that
+// the lock is requested rather than reproducing the race.
+func TestDatabaseService_AppendEvent_LocksSharedStateRows(t *testing.T) {
+	s := emptyService(t)
+	created, err := s.Create(t.Context(), &session.CreateRequest{AppName: "app", UserID: "user"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	lockedTables := map[string]bool{}
+	if err := s.db.Callback().Query().Before("gorm:query").Register("test:record_locks", func(tx *gorm.DB) {
+		if _, ok := tx.Statement.Clauses["FOR"]; ok {
+			lockedTables[tx.Statement.Table] = true
+		}
+	}); err != nil {
+		t.Fatalf("register callback: %v", err)
+	}
+	t.Cleanup(func() { _ = s.db.Callback().Query().Remove("test:record_locks") })
+
+	event := &session.Event{
+		ID:        "e1",
+		Author:    "user",
+		Timestamp: time.Now(),
+		Actions: session.EventActions{
+			StateDelta: map[string]any{"app:a": 1, "user:u": 2},
+		},
+	}
+	if err := s.AppendEvent(t.Context(), created.Session, event); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+
+	for _, table := range []string{"app_states", "user_states"} {
+		if !lockedTables[table] {
+			t.Errorf("AppendEvent read %s without FOR UPDATE; locked tables = %v", table, lockedTables)
+		}
+	}
+
+	got, err := s.Get(t.Context(), &session.GetRequest{AppName: "app", UserID: "user", SessionID: created.Session.ID()})
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	for key, want := range map[string]any{"app:a": 1.0, "user:u": 2.0} {
+		if v, err := got.Session.State().Get(key); err != nil || v != want {
+			t.Errorf("state[%q] = %v, %v; want %v", key, v, err, want)
+		}
+	}
+}
