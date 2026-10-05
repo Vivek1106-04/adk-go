@@ -399,9 +399,16 @@ func TestLoopAgentStopsOnSubAgentError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A sub-agent after the failing one tells "stop now" apart from "finish
+	// this pass over the sub-agents, then stop".
+	nextLLM := &FakeLLM{id: 1}
+	next, err := llmagent.New(llmagent.Config{Name: "next", Model: nextLLM})
+	if err != nil {
+		t.Fatal(err)
+	}
 	// No MaxIterations: the loop is meant to end when a sub-agent escalates.
 	loopAgent, err := loopagent.New(loopagent.Config{
-		AgentConfig: agent.Config{Name: "loop", SubAgents: []agent.Agent{worker}},
+		AgentConfig: agent.Config{Name: "loop", SubAgents: []agent.Agent{worker, next}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -429,5 +436,8 @@ func TestLoopAgentStopsOnSubAgentError(t *testing.T) {
 	}
 	if llm.calls != 1 {
 		t.Errorf("model called %d times, want 1", llm.calls)
+	}
+	if nextLLM.callCounter != 0 {
+		t.Errorf("next agent's model called %d times after worker failed, want 0", nextLLM.callCounter)
 	}
 }

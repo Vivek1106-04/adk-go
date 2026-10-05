@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"iter"
+	"strings"
 	"testing"
 	"time"
 
@@ -847,7 +848,9 @@ func TestSequentialAgent_RunLive_NestedSequentialOrchestration(t *testing.T) {
 }
 
 // failingLLM fails every call, as a model does on a quota or auth error.
-type failingLLM struct{}
+type failingLLM struct {
+	calls int
+}
 
 func (f *failingLLM) Name() string {
 	return "failing-llm"
@@ -855,12 +858,14 @@ func (f *failingLLM) Name() string {
 
 func (f *failingLLM) GenerateContent(ctx context.Context, req *model.LLMRequest, stream bool) iter.Seq2[*model.LLMResponse, error] {
 	return func(yield func(*model.LLMResponse, error) bool) {
+		f.calls++
 		yield(nil, fmt.Errorf("model unavailable"))
 	}
 }
 
 func TestSequentialAgentStopsOnSubAgentError(t *testing.T) {
-	first, err := llmagent.New(llmagent.Config{Name: "first", Model: &failingLLM{}})
+	firstLLM := &failingLLM{}
+	first, err := llmagent.New(llmagent.Config{Name: "first", Model: firstLLM})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -881,15 +886,18 @@ func TestSequentialAgentStopsOnSubAgentError(t *testing.T) {
 
 	// Keep reading after an error, as the run_sse handler and the console
 	// launcher do.
-	errCount := 0
+	var errs []error
 	for _, err := range r.Run(t.Context(), "user_id", "session_id", genai.NewContentFromText("go", genai.RoleUser), agent.RunConfig{}) {
 		if err != nil {
-			errCount++
+			errs = append(errs, err)
 		}
 	}
 
-	if errCount != 1 {
-		t.Errorf("got %d errors, want 1", errCount)
+	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "model unavailable") {
+		t.Errorf("got errors %v, want exactly one from the first agent's model", errs)
+	}
+	if firstLLM.calls != 1 {
+		t.Errorf("first agent's model called %d times, want 1", firstLLM.calls)
 	}
 	if secondLLM.callCounter != 0 {
 		t.Errorf("second agent's model called %d times after the first agent failed, want 0", secondLLM.callCounter)
