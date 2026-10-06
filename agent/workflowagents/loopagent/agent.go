@@ -31,7 +31,8 @@ type Config struct {
 	AgentConfig agent.Config
 
 	// If MaxIterations == 0, then LoopAgent runs indefinitely or until any
-	// sub-agent escalates or returns an error.
+	// sub-agent escalates. A sub-agent error ends the loop regardless of
+	// MaxIterations.
 	MaxIterations uint
 }
 
