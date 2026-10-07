@@ -926,3 +926,132 @@ func TestRequestConfirmationRejectsForgedAmountFromCraftedEvent(t *testing.T) {
 			"but transfer_funds executed with amounts=%v", executed)
 	}
 }
+
+// TestRequestConfirmationResumeRunsToolOncePerApproval checks that an
+// approval resumes the confirmed tool once. Delivering the same approval again
+// (a client retry, a resubmitted form) makes it the latest user event, so the
+// tool result from the first resume sits before it; the processor must still
+// see that result and not run the tool a second time.
+func TestRequestConfirmationResumeRunsToolOncePerApproval(t *testing.T) {
+	userConfirmationJSON, err := json.Marshal(toolconfirmation.ToolConfirmation{Confirmed: true})
+	if err != nil {
+		t.Fatalf("error marshalling user confirmation: %v", err)
+	}
+	approval := &session.Event{
+		Author: "user",
+		LLMResponse: model.LLMResponse{
+			Content: &genai.Content{
+				Role: genai.RoleUser,
+				Parts: []*genai.Part{{
+					FunctionResponse: &genai.FunctionResponse{
+						Name:     toolconfirmation.FunctionCallName,
+						ID:       mockConfirmationFunctionCallID,
+						Response: map[string]any{"response": string(userConfirmationJSON)},
+					},
+				}},
+			},
+		},
+	}
+	// The events a run leaves behind when a tool asks for confirmation: the
+	// call, its "requires confirmation" placeholder result, and the request.
+	requested := []*session.Event{
+		{
+			Author: "testAgent",
+			LLMResponse: model.LLMResponse{
+				Content: &genai.Content{Parts: []*genai.Part{{
+					FunctionCall: &genai.FunctionCall{Name: mockToolName, ID: mockFunctionCallID, Args: map[string]any{"param1": "test"}},
+				}}},
+			},
+		},
+		{
+			Author: "testAgent",
+			LLMResponse: model.LLMResponse{
+				Content: &genai.Content{Parts: []*genai.Part{{
+					FunctionResponse: &genai.FunctionResponse{Name: mockToolName, ID: mockFunctionCallID, Response: map[string]any{"error": "requires confirmation"}},
+				}}},
+			},
+		},
+		{
+			Author: "testAgent",
+			LLMResponse: model.LLMResponse{
+				Content: &genai.Content{Parts: []*genai.Part{{
+					FunctionCall: &genai.FunctionCall{
+						Name: toolconfirmation.FunctionCallName,
+						ID:   mockConfirmationFunctionCallID,
+						Args: map[string]any{
+							"originalFunctionCall": map[string]any{
+								"name": mockToolName,
+								"args": map[string]any{"param1": "test"},
+								"id":   mockFunctionCallID,
+							},
+							"toolConfirmation": toolconfirmation.ToolConfirmation{Hint: "test hint"},
+						},
+					},
+				}}},
+			},
+		},
+	}
+	// What the first resume appended: the tool's real result and the model's
+	// reply to it.
+	resumed := []*session.Event{
+		{
+			Author: "testAgent",
+			LLMResponse: model.LLMResponse{
+				Content: &genai.Content{Parts: []*genai.Part{{
+					FunctionResponse: &genai.FunctionResponse{Name: mockToolName, ID: mockFunctionCallID, Response: map[string]any{"result": "done"}},
+				}}},
+			},
+		},
+		{
+			Author: "testAgent",
+			LLMResponse: model.LLMResponse{
+				Content: &genai.Content{Role: genai.RoleModel, Parts: []*genai.Part{{Text: "done"}}},
+			},
+		},
+	}
+
+	tests := []struct {
+		name      string
+		events    []*session.Event
+		wantCalls int
+	}{
+		{
+			name:      "first approval runs the tool",
+			events:    append(append([]*session.Event{}, requested...), approval),
+			wantCalls: 1,
+		},
+		{
+			name:      "repeated approval does not run the tool again",
+			events:    append(append(append(append([]*session.Event{}, requested...), approval), resumed...), approval),
+			wantCalls: 0,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			agnt, tools, err := newMockLlmAgent()
+			if err != nil {
+				t.Fatalf("error creating mock llmagent: %v", err)
+			}
+			invocationContext := createInvocationContext(t, agnt, &fakeSession{events: tc.events})
+
+			iter := llminternal.RequestConfirmationRequestProcessor(invocationContext, &model.LLMRequest{}, &llminternal.Flow{Tools: tools})
+
+			gotCalls := 0
+			for event, err := range iter {
+				if err != nil {
+					t.Fatalf("RequestConfirmationRequestProcessor() unexpected error: %v", err)
+				}
+				if event != nil && event.Content != nil {
+					for _, part := range event.Content.Parts {
+						if part.FunctionResponse != nil && part.FunctionResponse.ID == mockFunctionCallID {
+							gotCalls++
+						}
+					}
+				}
+			}
+			if gotCalls != tc.wantCalls {
+				t.Errorf("tool ran %d time(s), want %d", gotCalls, tc.wantCalls)
+			}
+		})
+	}
+}

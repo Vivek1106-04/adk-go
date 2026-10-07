@@ -53,7 +53,6 @@ func RequestConfirmationRequestProcessor(ctx agent.InvocationContext, req *model
 			}
 		}
 		confirmationResponses := make(map[string]toolconfirmation.ToolConfirmation)
-		confirmationEventIndex := -1
 		for k := len(events) - 1; k >= 0; k-- {
 			event := events[k]
 			// Find the first event authored by user
@@ -98,7 +97,6 @@ func RequestConfirmationRequestProcessor(ctx agent.InvocationContext, req *model
 				}
 				confirmationResponses[funcResp.ID] = tc
 			}
-			confirmationEventIndex = k
 			break
 		}
 
@@ -152,7 +150,7 @@ func RequestConfirmationRequestProcessor(ctx agent.InvocationContext, req *model
 			}
 		}
 
-		// TODO could we skip events for >= confirmationEventIndex
+		// TODO could we skip events at or after the confirmation response event
 		for k := len(events) - 2; k >= 0; k-- {
 			event := events[k]
 			// Find the system generated FunctionCall event requesting the tool confirmation.
@@ -214,8 +212,13 @@ func RequestConfirmationRequestProcessor(ctx agent.InvocationContext, req *model
 			}
 
 			// TODO consider forward or backward pass instead of nested loops
-			// Remove the tools that have already been confirmed.
-			for j := len(events) - 1; j > confirmationEventIndex; j-- {
+			// Remove the tools that have already been confirmed. Scan everything
+			// after the confirmation request, not just after the latest approval:
+			// the same approval delivered again (a client retry, a resubmitted
+			// form) becomes the latest user event, and the result of the run it
+			// already resumed then sits before it. The "requires confirmation"
+			// placeholder result comes before the request, so it is not counted.
+			for j := len(events) - 1; j > k; j-- {
 				event = events[j]
 				responses := utils.FunctionResponses(event.Content)
 				if len(responses) == 0 {
