@@ -441,22 +441,27 @@ func (s *databaseService) applyEvent(ctx context.Context, sess *localSession, ev
 		// them. Otherwise a concurrent append from another session reads the
 		// same row and the later write drops the earlier one's keys. This
 		// matches adk-python, which locks these rows FOR UPDATE.
-		appTx, userTx := tx, tx
+		//
+		// Lock and read the app row before touching the user row. Create
+		// writes app then user, and inserting the user row first would hold
+		// it while waiting for an app row lock that Create holds, so the two
+		// could deadlock.
+		appTx := tx
 		if len(appDelta) > 0 {
 			if appTx, err = lockStateRow(tx, &storageAppState{AppName: sess.AppName(), State: map[string]any{}, UpdateTime: event.Timestamp}); err != nil {
 				return fmt.Errorf("failed to lock app state: %w", err)
 			}
 		}
+		storageApp, err := fetchStorageAppState(appTx, sess.AppName())
+		if err != nil {
+			return err
+		}
+
+		userTx := tx
 		if len(userDelta) > 0 {
 			if userTx, err = lockStateRow(tx, &storageUserState{AppName: sess.AppName(), UserID: sess.UserID(), State: map[string]any{}, UpdateTime: event.Timestamp}); err != nil {
 				return fmt.Errorf("failed to lock user state: %w", err)
 			}
-		}
-
-		// Fetch App and User states.
-		storageApp, err := fetchStorageAppState(appTx, sess.AppName())
-		if err != nil {
-			return err
 		}
 		storageUser, err := fetchStorageUserState(userTx, sess.AppName(), sess.UserID())
 		if err != nil {
