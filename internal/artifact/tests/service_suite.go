@@ -72,6 +72,49 @@ func TestArtifactService(t *testing.T, name string, factory func(t *testing.T) (
 		}
 		testArtifactService_GetArtifactVersion(ctx, t, srv, name)
 	})
+	t.Run(fmt.Sprintf("Test%sArtifactService_Isolation", name), func(t *testing.T) {
+		srv, err := factory(t)
+		if err != nil {
+			t.Fatalf("Failed to set up service: %v", err)
+		}
+		testArtifactService_Isolation(t.Context(), t, srv)
+	})
+}
+
+// testArtifactService_Isolation checks that a saved version does not change
+// when the caller later mutates the part it saved or a part it loaded.
+func testArtifactService_Isolation(ctx context.Context, t *testing.T, srv artifact.Service) {
+	appName, userID, sessionID, fileName := "app", "user", "session", "blob.bin"
+	part := genai.NewPartFromBytes([]byte("original"), "application/octet-stream")
+	if _, err := srv.Save(ctx, &artifact.SaveRequest{
+		AppName: appName, UserID: userID, SessionID: sessionID, FileName: fileName, Part: part,
+	}); err != nil {
+		t.Fatalf("Save() failed: %v", err)
+	}
+	loadReq := &artifact.LoadRequest{AppName: appName, UserID: userID, SessionID: sessionID, FileName: fileName}
+	want := genai.NewPartFromBytes([]byte("original"), "application/octet-stream")
+
+	// Reuse the saved buffer, as a caller streaming chunks would.
+	copy(part.InlineData.Data, "MUTATED!")
+	part.InlineData.MIMEType = "text/plain"
+	got, err := srv.Load(ctx, loadReq)
+	if err != nil {
+		t.Fatalf("Load() failed: %v", err)
+	}
+	if diff := cmp.Diff(want, got.Part); diff != "" {
+		t.Errorf("Load() after mutating the saved part mismatch (-want +got):\n%s", diff)
+	}
+
+	// Mutate what Load returned; the stored version must not follow.
+	copy(got.Part.InlineData.Data, "MUTATED!")
+	got.Part.InlineData.MIMEType = "text/plain"
+	again, err := srv.Load(ctx, loadReq)
+	if err != nil {
+		t.Fatalf("Load() failed: %v", err)
+	}
+	if diff := cmp.Diff(want, again.Part); diff != "" {
+		t.Errorf("Load() after mutating a loaded part mismatch (-want +got):\n%s", diff)
+	}
 }
 
 func testArtifactService_ListSessionNamedUser(t *testing.T, srv artifact.Service) {

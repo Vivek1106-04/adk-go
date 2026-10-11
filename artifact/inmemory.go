@@ -15,6 +15,7 @@
 package artifact
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io/fs"
@@ -52,6 +53,20 @@ type inMemoryService struct {
 // InMemoryService returns a new in-memory artifact service.
 func InMemoryService() Service {
 	return &inMemoryService{}
+}
+
+// copyPart returns a copy of p that shares no artifact content with it, so a
+// stored version cannot change when the caller mutates the part it saved or
+// loaded. Artifact content is Text or InlineData (see SaveRequest.Validate);
+// Text is copied with the struct and InlineData is copied explicitly.
+func copyPart(p *genai.Part) *genai.Part {
+	out := *p
+	if p.InlineData != nil {
+		blob := *p.InlineData
+		blob.Data = bytes.Clone(p.InlineData.Data)
+		out.InlineData = &blob
+	}
+	return &out
 }
 
 // fileHasUserNamespace checks if a filename indicates a user scoped artifact.
@@ -175,7 +190,7 @@ func (s *inMemoryService) Save(ctx context.Context, req *SaveRequest) (*SaveResp
 		nextVersion = internalVer + 1
 	}
 	s.set(appName, userID, sessionID, fileName, nextVersion, &artifactEntry{
-		part:           req.Part,
+		part:           copyPart(req.Part),
 		createTime:     createTime,
 		customMetadata: customMetadata,
 	})
@@ -231,14 +246,14 @@ func (s *inMemoryService) Load(ctx context.Context, req *LoadRequest) (*LoadResp
 		if !ok {
 			return nil, fmt.Errorf("artifact not found: %w", fs.ErrNotExist)
 		}
-		return &LoadResponse{Part: entry.part}, nil
+		return &LoadResponse{Part: copyPart(entry.part)}, nil
 	}
 	// pick the latest version
 	_, entry, ok := s.find(appName, userID, sessionID, fileName)
 	if !ok {
 		return nil, fmt.Errorf("artifact not found: %w", fs.ErrNotExist)
 	}
-	return &LoadResponse{Part: entry.part}, nil
+	return &LoadResponse{Part: copyPart(entry.part)}, nil
 }
 
 // List implements [artifact.Service]
