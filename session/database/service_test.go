@@ -586,7 +586,7 @@ func TestDatabaseService_AppendEvent_LocksSharedStateRows(t *testing.T) {
 			}
 
 			if !slices.Equal(*got, tc.want) {
-				t.Errorf("AppendEvent state statements:\n got %q\nwant %q", got, tc.want)
+				t.Errorf("AppendEvent state statements:\n got %q\nwant %q", *got, tc.want)
 			}
 
 			resp, err := s.Get(t.Context(), &session.GetRequest{AppName: "app", UserID: "user", SessionID: created.Session.ID()})
@@ -676,9 +676,37 @@ func TestDatabaseService_Create_LocksSharedStateRows(t *testing.T) {
 	}
 }
 
-// recordStateRowStatements records the statements s issues against the
-// app_states and user_states tables from now until the test ends, noting the
-// ON CONFLICT and FOR UPDATE clauses that make them safe to run concurrently.
+// When the shared rows already exist, Create must keep the keys another
+// session wrote there and return them in the new session's state.
+func TestDatabaseService_Create_KeepsExistingSharedState(t *testing.T) {
+	s := emptyService(t)
+	if _, err := s.Create(t.Context(), &session.CreateRequest{AppName: "app", UserID: "user", State: map[string]any{"app:a": 1, "user:a": 1}}); err != nil {
+		t.Fatalf("first Create: %v", err)
+	}
+
+	created, err := s.Create(t.Context(), &session.CreateRequest{AppName: "app", UserID: "user", State: map[string]any{"app:b": 2, "user:b": 2}})
+	if err != nil {
+		t.Fatalf("second Create: %v", err)
+	}
+
+	resp, err := s.Get(t.Context(), &session.GetRequest{AppName: "app", UserID: "user", SessionID: created.Session.ID()})
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	want := map[string]float64{"app:a": 1, "user:a": 1, "app:b": 2, "user:b": 2}
+	for name, state := range map[string]session.State{"Create": created.Session.State(), "Get": resp.Session.State()} {
+		for key, w := range want {
+			if v, err := state.Get(key); err != nil || fmt.Sprint(v) != fmt.Sprint(w) {
+				t.Errorf("%s state[%q] = %v, %v; want %v", name, key, v, err, w)
+			}
+		}
+	}
+}
+
+// recordStateRowStatements records the inserts and selects s issues against
+// the app_states and user_states tables from now until the test ends, noting
+// the ON CONFLICT and FOR UPDATE clauses that make them safe to run
+// concurrently. Updates are not recorded.
 func recordStateRowStatements(t *testing.T, s *databaseService) *[]string {
 	t.Helper()
 	var got []string
