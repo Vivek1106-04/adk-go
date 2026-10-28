@@ -449,7 +449,8 @@ func TestModelCallbacks(t *testing.T) {
 }
 
 // streamingTextModel streams two partial text deltas followed by the final
-// aggregated response, which carries the call's usage metadata.
+// aggregated response, which ends the turn and carries the call's usage
+// metadata.
 type streamingTextModel struct {
 	usage *genai.GenerateContentResponseUsageMetadata
 }
@@ -466,6 +467,7 @@ func (m *streamingTextModel) GenerateContent(ctx context.Context, req *model.LLM
 		yield(&model.LLMResponse{
 			Content:       genai.NewContentFromText("Hello world.", genai.RoleModel),
 			UsageMetadata: m.usage,
+			TurnComplete:  true,
 		}, nil)
 	}
 }
@@ -519,14 +521,18 @@ func TestAfterModelCallbackReplacementKeepsStreamingFields(t *testing.T) {
 				t.Fatalf("CollectEvents() error = %v", err)
 			}
 
-			var gotPartial []bool
+			var gotPartial, gotTurnComplete []bool
 			var gotUsage []*genai.GenerateContentResponseUsageMetadata
 			for _, ev := range events {
 				gotPartial = append(gotPartial, ev.Partial)
+				gotTurnComplete = append(gotTurnComplete, ev.TurnComplete)
 				gotUsage = append(gotUsage, ev.UsageMetadata)
 			}
 			if diff := cmp.Diff([]bool{true, true, false}, gotPartial); diff != "" {
 				t.Errorf("event Partial flags mismatch (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff([]bool{false, false, true}, gotTurnComplete); diff != "" {
+				t.Errorf("event TurnComplete flags mismatch (-want +got):\n%s", diff)
 			}
 			if diff := cmp.Diff(tc.wantUsage, gotUsage); diff != "" {
 				t.Errorf("event UsageMetadata mismatch (-want +got):\n%s", diff)
@@ -550,8 +556,8 @@ func TestAfterModelCallbackReplacementKeepsStreamingFields(t *testing.T) {
 
 			// The callback's own response objects are not modified.
 			for _, r := range returned {
-				if r.Partial || (r.UsageMetadata != nil && r.UsageMetadata != ownUsage) {
-					t.Errorf("callback response was mutated: Partial=%v UsageMetadata=%v", r.Partial, r.UsageMetadata)
+				if r.Partial || r.TurnComplete || (r.UsageMetadata != nil && r.UsageMetadata != ownUsage) {
+					t.Errorf("callback response was mutated: Partial=%v TurnComplete=%v UsageMetadata=%v", r.Partial, r.TurnComplete, r.UsageMetadata)
 				}
 			}
 		})

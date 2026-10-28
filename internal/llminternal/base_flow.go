@@ -1057,25 +1057,31 @@ func (f *Flow) callLLM(ctx agent.InvocationContext, req *model.LLMRequest, state
 // still answering the same model call. If the replacement drops Partial, every
 // streamed delta looks final: SSE clients render each delta as a complete
 // turn and the runner persists each one as a separate session event. If it
-// drops UsageMetadata, the call disappears from token accounting.
+// drops TurnComplete, clients never see the turn end. If it drops
+// UsageMetadata, the call disappears from token accounting.
 //
-// Partial is a plain bool, so an unset value cannot be told apart from an
-// explicit false; a delta is never final while the stream continues, so a
-// partial original keeps its replacement partial. UsageMetadata set on the
-// replacement is respected. The replacement is copied rather than modified,
-// and returned as is when nothing needs filling.
+// Partial and TurnComplete are plain bools, so an unset value cannot be told
+// apart from an explicit false; a delta is never final while the stream
+// continues, so a partial original keeps its replacement partial, and a
+// response that ended the turn keeps its replacement ending it. UsageMetadata
+// set on the replacement is respected. The replacement is copied rather than
+// modified, and returned as is when nothing needs filling.
 func inheritModelFields(original, replacement *model.LLMResponse) *model.LLMResponse {
 	if original == nil {
 		return replacement
 	}
 	inheritPartial := original.Partial && !replacement.Partial
+	inheritTurnComplete := original.TurnComplete && !replacement.TurnComplete
 	inheritUsage := original.UsageMetadata != nil && replacement.UsageMetadata == nil
-	if !inheritPartial && !inheritUsage {
+	if !inheritPartial && !inheritTurnComplete && !inheritUsage {
 		return replacement
 	}
 	merged := *replacement
 	if inheritPartial {
 		merged.Partial = true
+	}
+	if inheritTurnComplete {
+		merged.TurnComplete = true
 	}
 	if inheritUsage {
 		merged.UsageMetadata = original.UsageMetadata
