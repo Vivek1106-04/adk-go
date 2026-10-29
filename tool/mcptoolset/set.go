@@ -62,9 +62,11 @@ func New(cfg Config) (tool.Toolset, error) {
 	if err != nil {
 		return nil, err
 	}
-	var client sessionClient = newConnectionRefresher(cfg.Client, transport)
+	var client sessionClient
 	if cfg.Auth != nil {
-		client = newPerUserClients(cfg.Client, transport)
+		client = newCredentialSessions(cfg.Client, transport, cfg.Auth)
+	} else {
+		client = newConnectionRefresher(cfg.Client, transport)
 	}
 	return &set{
 		mcpClient:                   client,
@@ -128,10 +130,11 @@ type Config struct {
 	// Combining Auth with a non-HTTP transport (e.g. a stdio command) is a
 	// configuration error. See package google.golang.org/adk/v2/auth.
 	//
-	// With Auth set, each acting user (app and user from the ADK context) gets
-	// an MCP session of its own, so a server that binds sessions to the user
-	// who created them serves every user. Sessions stay open until the toolset
-	// is closed.
+	// With Auth set, each distinct credential the provider resolves gets an
+	// MCP session of its own, so a server that binds sessions to the user who
+	// created them serves every user, while a user-independent credential such
+	// as auth.StaticToken keeps one session. A session idle for 10 minutes is
+	// closed, and at most 64 are kept open unless more are in use at once.
 	//
 	// Don't also set OAuthHandler on a supplied *mcp.StreamableClientTransport:
 	// Auth is applied last and overwrites the Authorization header, so the two
@@ -163,7 +166,7 @@ type Config struct {
 }
 
 // sessionClient is the MCP connection a set uses: one shared session, or one
-// per acting user when Config.Auth is set.
+// per credential when Config.Auth is set.
 type sessionClient interface {
 	MCPClient
 	io.Closer

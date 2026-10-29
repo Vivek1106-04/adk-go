@@ -16,16 +16,22 @@ package mcptoolset
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
+	"slices"
 	"sync"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"golang.org/x/sync/semaphore"
 
 	"google.golang.org/adk/v2/agent"
+	"google.golang.org/adk/v2/auth"
+	"google.golang.org/adk/v2/internal/adkcontext"
 	"google.golang.org/adk/v2/internal/version"
 )
 
@@ -47,6 +53,10 @@ type connectionRefresher struct {
 	mu      *semaphore.Weighted
 	session *mcp.ClientSession
 	closed  bool
+
+	// identityOnlyConnect connects sessions on identityOnlyContext(ctx)
+	// rather than ctx.
+	identityOnlyConnect bool
 
 	closeOnce sync.Once
 	closeErr  error
@@ -190,7 +200,7 @@ func (c *connectionRefresher) getSession(ctx context.Context) (*mcp.ClientSessio
 		return c.session, nil
 	}
 
-	session, err := c.client.Connect(ctx, c.transport, nil)
+	session, err := c.connect(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init MCP session: %w", err)
 	}
@@ -221,7 +231,7 @@ func (c *connectionRefresher) refreshConnection(ctx context.Context) (*mcp.Clien
 		c.session = nil
 	}
 
-	session, err := c.client.Connect(ctx, c.transport, nil)
+	session, err := c.connect(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to refresh MCP session: %w", err)
 	}
@@ -230,51 +240,128 @@ func (c *connectionRefresher) refreshConnection(ctx context.Context) (*mcp.Clien
 	return c.session, nil
 }
 
-var _ MCPClient = (*connectionRefresher)(nil)
-
-// userKey identifies the acting user an MCP session belongs to.
-type userKey struct {
-	appName string
-	userID  string
+// connect opens a new MCP session. The caller holds c.mu.
+func (c *connectionRefresher) connect(ctx context.Context) (*mcp.ClientSession, error) {
+	if !c.identityOnlyConnect {
+		return c.client.Connect(ctx, c.transport, nil)
+	}
+	connCtx, stop := identityOnlyContext(ctx)
+	defer stop()
+	return c.client.Connect(connCtx, c.transport, nil)
 }
 
-// perUserClients gives each acting user an MCP session of its own, keyed by
-// the app and user from [agent.IdentityFromContext].
+// disconnected reports whether c has no session and no connection attempt
+// in progress.
+func (c *connectionRefresher) disconnected() bool {
+	if !c.mu.TryAcquire(1) {
+		return false
+	}
+	defer c.mu.Release(1)
+	return c.session == nil
+}
+
+var _ MCPClient = (*connectionRefresher)(nil)
+
+// Bounds on the sessions a credentialSessions keeps. Variables so tests can
+// shrink them.
+var (
+	// sessionIdleTimeout is how long a session may go unused before it is
+	// closed.
+	sessionIdleTimeout = 10 * time.Minute
+	// maxSessions caps the sessions kept open. Sessions in use are never
+	// evicted, so the cap is exceeded only while more than that many are busy.
+	maxSessions = 64
+)
+
+// credentialSessions gives each distinct credential an MCP session of its own.
 //
-// It is used when Config.Auth is set. The credential then differs per user,
-// and an MCP server that binds a session to the user who created it (as the
-// MCP spec recommends, and as go-sdk servers do whenever their token verifier
-// reports a UserID) rejects requests on another user's session. A single
-// shared session would work only for whichever user opened it, and a rejected
-// request from another user would also close it for that user.
+// It is used when Config.Auth is set. An MCP server that binds a session to
+// the user who created it (as the MCP spec recommends, and as go-sdk servers do
+// whenever their token verifier reports a UserID) rejects requests made on that
+// session with another user's credential, and the rejection also closes the
+// session for its owner. So a provider that mints a credential per user needs a
+// session per user, while a user-independent one such as [auth.StaticToken]
+// serves every caller on one session. Keying sessions on the credential the
+// provider resolves covers both, as adk-python does with its header-based
+// session key.
 //
-// A context without an identity, or with an empty UserID, shares one session,
-// which is what every caller got before.
-//
-// Sessions are kept until Close, one per user that has called the toolset.
-type perUserClients struct {
+// A session is closed once it has been idle for sessionIdleTimeout, or when
+// the pool is full and it is the least recently used idle one.
+type credentialSessions struct {
 	client    *mcp.Client
 	transport mcp.Transport
+	provider  auth.CredentialProvider
 
 	mu       sync.Mutex
 	closed   bool
-	sessions map[userKey]*connectionRefresher
+	sessions map[string]*pooledSession
+	// evicting tracks evicted sessions that are still closing, so Close can
+	// wait for them.
+	evicting sync.WaitGroup
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
-func newPerUserClients(client *mcp.Client, transport mcp.Transport) *perUserClients {
-	return &perUserClients{
+// pooledSession is one credential's connection and its use. inUse and lastUsed
+// are guarded by credentialSessions.mu.
+type pooledSession struct {
+	key      string
+	conn     *connectionRefresher
+	inUse    int
+	lastUsed time.Time
+}
+
+func newCredentialSessions(client *mcp.Client, transport mcp.Transport, provider auth.CredentialProvider) *credentialSessions {
+	return &credentialSessions{
 		client:    orDefaultClient(client),
 		transport: transport,
-		sessions:  make(map[userKey]*connectionRefresher),
+		provider:  provider,
+		sessions:  make(map[string]*pooledSession),
 	}
 }
 
-// forUser returns the connection of the user acting in ctx, creating it on
-// first use. The connection itself connects lazily.
-func (p *perUserClients) forUser(ctx context.Context) (*connectionRefresher, error) {
-	var key userKey
-	if id, ok := agent.IdentityFromContext(ctx); ok && id.UserID != "" {
-		key = userKey{appName: id.AppName, userID: id.UserID}
+// sessionKey returns a digest of the headers the provider's credential sets
+// for the caller in ctx.
+func (p *credentialSessions) sessionKey(ctx context.Context) (string, error) {
+	cred, err := p.provider.Credential(ctx)
+	if err != nil {
+		return "", fmt.Errorf("auth: resolve credential: %w", err)
+	}
+	if cred == nil {
+		return "", fmt.Errorf("auth: provider returned nil credential")
+	}
+	h := http.Header{}
+	if err := cred.Apply(h); err != nil {
+		return "", fmt.Errorf("auth: apply credential: %w", err)
+	}
+	names := make([]string, 0, len(h))
+	for name := range h {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	// Length-prefix every field so that no two header sets encode alike.
+	var b []byte
+	for _, name := range names {
+		b = fmt.Appendf(b, "%d:%s%d:", len(name), name, len(h[name]))
+		for _, v := range h[name] {
+			b = fmt.Appendf(b, "%d:%s", len(v), v)
+		}
+	}
+	sum := sha256.Sum256(b)
+	return string(sum[:]), nil
+}
+
+// acquire returns the session for the credential of the caller in ctx,
+// creating it on first use, and marks it in use until release. The session
+// itself connects lazily.
+func (p *credentialSessions) acquire(ctx context.Context) (*pooledSession, error) {
+	if p.isClosed() {
+		return nil, mcp.ErrConnectionClosed
+	}
+	key, err := p.sessionKey(ctx)
+	if err != nil {
+		return nil, err
 	}
 
 	p.mu.Lock()
@@ -282,48 +369,136 @@ func (p *perUserClients) forUser(ctx context.Context) (*connectionRefresher, err
 	if p.closed {
 		return nil, mcp.ErrConnectionClosed
 	}
-	c, ok := p.sessions[key]
+	now := time.Now()
+	s, ok := p.sessions[key]
+	p.evictLocked(now, !ok)
 	if !ok {
-		c = newConnectionRefresher(p.client, p.transport)
-		p.sessions[key] = c
+		conn := newConnectionRefresher(p.client, p.transport)
+		conn.identityOnlyConnect = true
+		s = &pooledSession{key: key, conn: conn}
+		p.sessions[key] = s
 	}
-	return c, nil
+	s.inUse++
+	s.lastUsed = now
+	return s, nil
 }
 
-// CallTool calls a tool on the acting user's MCP session.
-func (p *perUserClients) CallTool(ctx context.Context, params *mcp.CallToolParams) (*mcp.CallToolResult, error) {
-	c, err := p.forUser(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return c.CallTool(ctx, params)
-}
-
-// ListTools lists tools on the acting user's MCP session.
-func (p *perUserClients) ListTools(ctx context.Context) ([]*mcp.Tool, error) {
-	c, err := p.forUser(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return c.ListTools(ctx)
-}
-
-// Close closes every user's session. Later calls fail with
-// [mcp.ErrConnectionClosed].
-func (p *perUserClients) Close() error {
+func (p *credentialSessions) isClosed() bool {
 	p.mu.Lock()
-	p.closed = true
-	sessions := p.sessions
-	p.sessions = nil
-	p.mu.Unlock()
+	defer p.mu.Unlock()
+	return p.closed
+}
 
-	var errs []error
-	for _, c := range sessions {
-		if err := c.Close(); err != nil {
-			errs = append(errs, err)
+// release ends a use of s that finished with err. A session that never
+// connected, or lost its connection and could not reconnect, is dropped so the
+// pool does not keep entries for credentials the server refuses.
+func (p *credentialSessions) release(s *pooledSession, err error) {
+	drop := err != nil && s.conn.disconnected()
+
+	p.mu.Lock()
+	s.inUse--
+	s.lastUsed = time.Now()
+	if drop && s.inUse == 0 && p.sessions[s.key] == s {
+		p.evictSessionLocked(s)
+	}
+	p.mu.Unlock()
+}
+
+// evictLocked closes idle sessions unused for sessionIdleTimeout and, when
+// makeRoom is set and the pool is full, the least recently used idle session.
+func (p *credentialSessions) evictLocked(now time.Time, makeRoom bool) {
+	var lru *pooledSession
+	for _, s := range p.sessions {
+		if s.inUse > 0 {
+			continue
+		}
+		if now.Sub(s.lastUsed) >= sessionIdleTimeout {
+			p.evictSessionLocked(s)
+			continue
+		}
+		if lru == nil || s.lastUsed.Before(lru.lastUsed) {
+			lru = s
 		}
 	}
-	return errors.Join(errs...)
+	if makeRoom && len(p.sessions) >= maxSessions && lru != nil {
+		p.evictSessionLocked(lru)
+	}
 }
 
-var _ MCPClient = (*perUserClients)(nil)
+// evictSessionLocked removes s from the pool and closes it in the background,
+// since closing sends a request to the server.
+func (p *credentialSessions) evictSessionLocked(s *pooledSession) {
+	delete(p.sessions, s.key)
+	p.evicting.Go(func() {
+		// No caller is left to report a failure to, and the session is gone
+		// from the pool either way.
+		_ = s.conn.Close()
+	})
+}
+
+// CallTool calls a tool on the session for the caller's credential.
+func (p *credentialSessions) CallTool(ctx context.Context, params *mcp.CallToolParams) (result *mcp.CallToolResult, err error) {
+	s, err := p.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { p.release(s, err) }()
+	return s.conn.CallTool(ctx, params)
+}
+
+// ListTools lists tools on the session for the caller's credential.
+func (p *credentialSessions) ListTools(ctx context.Context) (tools []*mcp.Tool, err error) {
+	s, err := p.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { p.release(s, err) }()
+	return s.conn.ListTools(ctx)
+}
+
+// Close closes every session, waiting for connection setup and MCP operations
+// in progress, as [connectionRefresher.Close] does. It is safe to call
+// concurrently or more than once, and every call returns the first one's
+// result. Later operations fail with [mcp.ErrConnectionClosed].
+func (p *credentialSessions) Close() error {
+	p.closeOnce.Do(func() {
+		p.mu.Lock()
+		p.closed = true
+		sessions := p.sessions
+		p.sessions = nil
+		p.mu.Unlock()
+
+		var errs []error
+		for _, s := range sessions {
+			if err := s.conn.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		p.evicting.Wait()
+		p.closeErr = errors.Join(errs...)
+	})
+	return p.closeErr
+}
+
+var _ MCPClient = (*credentialSessions)(nil)
+
+// identityOnlyContext returns a context that carries the ADK identity of ctx
+// and no other value, and is canceled when ctx is until stop is called.
+//
+// go-sdk keeps the context a streamable session is connected on, minus its
+// cancellation, for the life of the session, so that the standalone stream and
+// the closing request carry the same values. Connecting on an invocation's
+// context would keep that whole invocation and its session in memory until the
+// MCP session closes. The identity is all the credential provider needs.
+func identityOnlyContext(ctx context.Context) (connCtx context.Context, stop func()) {
+	base := context.Background()
+	if id, ok := agent.IdentityFromContext(ctx); ok {
+		base = context.WithValue(base, adkcontext.IdentityKey, id)
+	}
+	connCtx, cancel := context.WithCancelCause(base)
+	stopCancel := context.AfterFunc(ctx, func() { cancel(context.Cause(ctx)) })
+	return connCtx, func() {
+		stopCancel()
+		cancel(nil)
+	}
+}
