@@ -146,10 +146,10 @@ const defaultEvictTimeout = 5 * time.Second
 //   - Every request must descend from the invoking user's context. A transport
 //     that shares one connection across invocations does not qualify.
 //     mcptoolset comes close: its per-call POSTs are per-user and each user's
-//     credential gets an MCP session of its own, but that session's standalone
-//     server-to-client stream and closing request run on a context carrying
-//     only the identity of the invocation that opened the session, not on any
-//     later invocation's context.
+//     credential gets an MCP session of its own, but that session's initialize
+//     handshake, standalone server-to-client stream and closing request run on
+//     a context carrying only the identity of the invocation that opened the
+//     session, not on any later invocation's context.
 //   - The transport must not follow a cross-host redirect. net/http strips
 //     Authorization above the RoundTripper, so [auth.Transport] re-resolves and
 //     re-applies the end user's credential to the redirect target. Set

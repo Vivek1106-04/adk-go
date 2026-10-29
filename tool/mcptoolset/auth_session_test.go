@@ -301,6 +301,25 @@ func TestAuthEvictsIdleSessions(t *testing.T) {
 	}
 }
 
+// TestAuthIdleSessionSameUserReturns checks that a user whose own session
+// went idle past the timeout gets a new session rather than the evicted one.
+func TestAuthIdleSessionSameUserReturns(t *testing.T) {
+	mcptoolset.SetSessionBoundsForTest(t, 50*time.Millisecond, 64)
+	server := newUserBoundServer(t)
+	ts := newAuthToolset(t, server, perUserToken)
+
+	callAs(t, ts, "app", "alice", "alice")
+	time.Sleep(100 * time.Millisecond)
+	callAs(t, ts, "app", "alice", "alice")
+
+	if n := mcptoolset.SessionCountForTest(ts); n != 1 {
+		t.Errorf("toolset keeps %d sessions, want 1", n)
+	}
+	if n := server.sessionsOf("alice"); n != 2 {
+		t.Errorf("alice used %d MCP sessions, want 2 (one evicted, one new)", n)
+	}
+}
+
 // TestAuthCapsOpenSessions checks that a full pool closes its least recently
 // used idle session to make room for a new one.
 func TestAuthCapsOpenSessions(t *testing.T) {

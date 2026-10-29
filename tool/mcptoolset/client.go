@@ -393,9 +393,12 @@ func (p *credentialSessions) acquire(ctx context.Context) (*pooledSession, error
 		return nil, mcp.ErrConnectionClosed
 	}
 	now := time.Now()
+	// Sweep before the lookup so an expired session of this key is replaced
+	// rather than handed out after it was evicted.
+	p.evictIdleLocked(now)
 	s, ok := p.sessions[key]
-	p.evictLocked(now, !ok)
 	if !ok {
+		p.makeRoomLocked()
 		conn := newConnectionRefresher(p.client, p.transport)
 		conn.identityOnlyConnect = true
 		s = &pooledSession{key: key, conn: conn}
@@ -416,34 +419,40 @@ func (p *credentialSessions) isClosed() bool {
 // connected, or lost its connection and could not reconnect, is dropped so the
 // pool does not keep entries for credentials the server refuses.
 func (p *credentialSessions) release(s *pooledSession, err error) {
-	drop := err != nil && s.conn.disconnected()
-
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	s.inUse--
 	s.lastUsed = time.Now()
-	if drop && s.inUse == 0 && p.sessions[s.key] == s {
+	// disconnected does not block, so checking it under mu means the last
+	// release of a failed session always sees it.
+	if err != nil && s.inUse == 0 && p.sessions[s.key] == s && s.conn.disconnected() {
 		p.evictSessionLocked(s)
 	}
-	p.mu.Unlock()
 }
 
-// evictLocked closes idle sessions unused for sessionIdleTimeout and, when
-// makeRoom is set and the pool is full, the least recently used idle session.
-func (p *credentialSessions) evictLocked(now time.Time, makeRoom bool) {
-	var lru *pooledSession
+// evictIdleLocked closes sessions unused for sessionIdleTimeout.
+func (p *credentialSessions) evictIdleLocked(now time.Time) {
 	for _, s := range p.sessions {
-		if s.inUse > 0 {
-			continue
-		}
-		if now.Sub(s.lastUsed) >= sessionIdleTimeout {
+		if s.inUse == 0 && now.Sub(s.lastUsed) >= sessionIdleTimeout {
 			p.evictSessionLocked(s)
-			continue
-		}
-		if lru == nil || s.lastUsed.Before(lru.lastUsed) {
-			lru = s
 		}
 	}
-	if makeRoom && len(p.sessions) >= maxSessions && lru != nil {
+}
+
+// makeRoomLocked closes least recently used idle sessions until there is room
+// for one more, or no idle session is left. A burst of concurrent callers can
+// leave the pool over maxSessions, so this may close more than one.
+func (p *credentialSessions) makeRoomLocked() {
+	for len(p.sessions) >= maxSessions {
+		var lru *pooledSession
+		for _, s := range p.sessions {
+			if s.inUse == 0 && (lru == nil || s.lastUsed.Before(lru.lastUsed)) {
+				lru = s
+			}
+		}
+		if lru == nil {
+			return
+		}
 		p.evictSessionLocked(lru)
 	}
 }
@@ -514,9 +523,9 @@ var _ MCPClient = (*credentialSessions)(nil)
 // context would keep that whole invocation and its session in memory until the
 // MCP session closes. The identity is all the credential provider needs.
 func identityOnlyContext(ctx context.Context) (connCtx context.Context, stop func()) {
-	base := context.Background()
+	var base identityContext
 	if id, ok := agent.IdentityFromContext(ctx); ok {
-		base = context.WithValue(base, adkcontext.IdentityKey, id)
+		base.id = &id
 	}
 	connCtx, cancel := context.WithCancelCause(base)
 	stopCancel := context.AfterFunc(ctx, func() { cancel(context.Cause(ctx)) })
@@ -524,4 +533,22 @@ func identityOnlyContext(ctx context.Context) (connCtx context.Context, stop fun
 		stopCancel()
 		cancel(nil)
 	}
+}
+
+// identityContext is a root context, never canceled and without a deadline,
+// that carries an ADK identity and no other value. It stands in for
+// context.Background, which library code must not use.
+type identityContext struct {
+	id *agent.Identity
+}
+
+func (identityContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (identityContext) Done() <-chan struct{}       { return nil }
+func (identityContext) Err() error                  { return nil }
+
+func (c identityContext) Value(key any) any {
+	if key == adkcontext.IdentityKey && c.id != nil {
+		return *c.id
+	}
+	return nil
 }
