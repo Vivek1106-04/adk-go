@@ -27,7 +27,6 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"golang.org/x/sync/semaphore"
 
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/auth"
@@ -48,9 +47,10 @@ type connectionRefresher struct {
 	client    *mcp.Client
 	transport mcp.Transport
 
-	// Session initialization and refresh perform network I/O. Waiters must be
-	// able to leave when their own context ends without interrupting the owner.
-	mu      *semaphore.Weighted
+	// mu is a one-slot channel rather than a mutex: session initialization and
+	// refresh perform network I/O, and waiters must be able to leave when their
+	// own context ends without interrupting the owner. See lock.
+	mu      chan struct{}
 	session *mcp.ClientSession
 	closed  bool
 
@@ -76,7 +76,7 @@ func newConnectionRefresher(client *mcp.Client, transport mcp.Transport) *connec
 	return &connectionRefresher{
 		client:    orDefaultClient(client),
 		transport: transport,
-		mu:        semaphore.NewWeighted(1),
+		mu:        make(chan struct{}, 1),
 	}
 }
 
@@ -91,19 +91,40 @@ func orDefaultClient(client *mcp.Client) *mcp.Client {
 func (c *connectionRefresher) Close() error {
 	c.closeOnce.Do(func() {
 		// Close has no caller context, so it waits for any connection attempt
-		// in progress. Acquire cannot fail with a context that is never done.
-		_ = c.mu.Acquire(context.Background(), 1)
+		// in progress.
+		c.mu <- struct{}{}
 		// Closing is final so failed in-flight calls cannot reconnect.
 		c.closed = true
 		session := c.session
 		c.session = nil
-		c.mu.Release(1)
+		c.unlock()
 
 		if session != nil {
 			c.closeErr = session.Close()
 		}
 	})
 	return c.closeErr
+}
+
+// lock takes mu, or returns ctx's error if ctx ends first. A ctx that is done
+// by the time mu is taken fails too, even when mu was free, as
+// semaphore.Weighted.Acquire does.
+func (c *connectionRefresher) lock(ctx context.Context) error {
+	select {
+	case c.mu <- struct{}{}:
+		// ctx may have ended while this call waited for mu to be handed over.
+		if err := ctx.Err(); err != nil {
+			c.unlock()
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *connectionRefresher) unlock() {
+	<-c.mu
 }
 
 // CallTool calls a tool on the MCP server, automatically reconnecting if needed.
@@ -188,10 +209,10 @@ func shouldRefreshConnection(err error) bool {
 }
 
 func (c *connectionRefresher) getSession(ctx context.Context) (*mcp.ClientSession, error) {
-	if err := c.mu.Acquire(ctx, 1); err != nil {
+	if err := c.lock(ctx); err != nil {
 		return nil, err
 	}
-	defer c.mu.Release(1)
+	defer c.unlock()
 
 	if c.closed {
 		return nil, mcp.ErrConnectionClosed
@@ -210,10 +231,10 @@ func (c *connectionRefresher) getSession(ctx context.Context) (*mcp.ClientSessio
 }
 
 func (c *connectionRefresher) refreshConnection(ctx context.Context) (*mcp.ClientSession, error) {
-	if err := c.mu.Acquire(ctx, 1); err != nil {
+	if err := c.lock(ctx); err != nil {
 		return nil, err
 	}
-	defer c.mu.Release(1)
+	defer c.unlock()
 
 	if c.closed {
 		return nil, mcp.ErrConnectionClosed
@@ -253,10 +274,12 @@ func (c *connectionRefresher) connect(ctx context.Context) (*mcp.ClientSession, 
 // disconnected reports whether c has no session and no connection attempt
 // in progress.
 func (c *connectionRefresher) disconnected() bool {
-	if !c.mu.TryAcquire(1) {
+	select {
+	case c.mu <- struct{}{}:
+	default:
 		return false
 	}
-	defer c.mu.Release(1)
+	defer c.unlock()
 	return c.session == nil
 }
 
